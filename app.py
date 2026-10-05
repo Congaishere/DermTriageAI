@@ -56,19 +56,43 @@ CLASSES = [
     "Tinea (Fungal/Ringworm)"
 ]
 
+
 # --- Model Loading ---
 @st.cache_resource
 def load_model():
-    model = models.mobilenet_v3_small(weights=None)
-    num_ftrs = model.classifier[3].in_features
-    model.classifier[3] = nn.Linear(num_ftrs, 4)
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'skin_model.pth')
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    model.eval()
-    return model
+  model = models.mobilenet_v3_small(weights=None)
+  num_ftrs = model.classifier[3].in_features
+  model.classifier[3] = nn.Linear(num_ftrs, 4)
 
-model = load_model()
+  base_dir = os.path.dirname(os.path.abspath(__file__))
+
+  # Search all possible places where weights could be
+  possible_paths = [
+      os.path.join(base_dir, '..', 'skin_model.pth'),
+      os.path.join(base_dir, 'skin_model.pth'),
+      os.path.join(base_dir, '..', 'skin_model'),
+      os.path.join(base_dir, 'skin_model'),
+      'skin_model.pth',
+  ]
+
+  loaded = False
+  for path in possible_paths:
+    if os.path.exists(path):
+      try:
+        model.load_state_dict(torch.load(path, map_location='cpu'))
+        loaded = True
+        break
+      except Exception:
+        pass
+
+  if not loaded:
+    st.error(
+        '🚨 Warning: skin_model.pth was NOT loaded! Please make sure'
+        ' skin_model.pth is in your root GitHub folder.'
+    )
+
+  model.eval()
+  return model
 
 # --- Image Preprocessing ---
 transform = transforms.Compose([
