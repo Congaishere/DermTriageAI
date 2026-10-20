@@ -1,237 +1,138 @@
-import streamlit as st
-import streamlit.components.v1 as components
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image
-import numpy as np
+"""Impetus research prototype. Does not provide clinical diagnoses or prescriptions."""
+from pathlib import Path
+import hashlib, io, json
+from datetime import datetime, timezone
 import cv2
-import pandas as pd
-import datetime
-import os
+import numpy as np
+from PIL import Image, ImageOps
+import streamlit as st
+import torch
+from torch import nn
+from torchvision import models, transforms
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Impetus",
-    page_icon="🔬",
-    layout="centered"
-)
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_PATH = ROOT / 'skin_model_multilabel.pth'
+DISPLAY = {'eczema':'Eczema (atopic/allergic)', 'impetigo':'Impetigo / pyoderma',
+           'psoriasis':'Psoriasis (plaque/scaly)', 'tinea':'Tinea (fungal)'}
+CLINICIAN_OPTIONS = list(DISPLAY.values()) + ['No visible target lesion', 'Other / uncertain']
+REFERENCE = {
+ 'eczema': 'Review history of itch, xerosis, distribution, exposures and possible secondary infection; verify management using current local dermatology guidance.',
+ 'impetigo': 'Check for crusting, purulence, systemic illness and need for microbiology; confirm treatment using current local antimicrobial guidance.',
+ 'psoriasis': 'Assess plaque morphology, distribution, nail/joint symptoms and alternatives; follow current local dermatology guidance.',
+ 'tinea': 'Consider confirmatory KOH/microscopy when appropriate and steroid-modified infection; follow current local antifungal guidance.'
+}
 
-# --- Force Mobile/iPad Safari Web App Name to "Impetus" ---
-components.html(
-    """
-    <script>
-        document.title = "Impetus";
-        window.parent.document.title = "Impetus";
-        
-        let metaApple = window.parent.document.querySelector('meta[name="apple-mobile-web-app-title"]');
-        if (!metaApple) {
-            metaApple = window.parent.document.createElement('meta');
-            metaApple.name = "apple-mobile-web-app-title";
-            window.parent.document.head.appendChild(metaApple);
-        }
-        metaApple.content = "Impetus";
+st.set_page_config(page_title='Impetus',page_icon='🔬',layout='centered')
+st.title('🔬 Impetus — Dermatology Research Prototype')
+st.caption('Four independent disease scores · experimental image enhancement · clinician evaluation')
+st.warning('Research-only prototype: scores are UNCALIBRATED and are not probabilities of disease, a healthy-skin diagnosis, or a substitute for independent assessment. Not for treatment decisions.')
 
-        let metaApp = window.parent.document.querySelector('meta[name="application-name"]');
-        if (!metaApp) {
-            metaApp = window.parent.document.createElement('meta');
-            metaApp.name = "application-name";
-            window.parent.document.head.appendChild(metaApp);
-        }
-        metaApp.content = "Impetus";
-    </script>
-    """,
-    height=0,
-    width=0,
-)
-
-# --- UI Header & Clinical Branding ---
-st.title("🔬 Impetus: Tropical Dermatoses Triage")
-st.caption("Clinical Decision-Support Calibrated for Fitzpatrick Types IV–VI | 4-Way Differential Analysis")
-
-CLASSES = [
-    "Eczema (Atopic/Allergic)",
-    "Impetigo / Pyoderma (Bacterial)",
-    "Psoriasis (Plaque/Scaly)",
-    "Tinea (Fungal/Ringworm)"
-]
-
-# --- Model Loading ---
 @st.cache_resource
 def load_model():
-    m = models.mobilenet_v3_small(weights=None)
-    num_ftrs = m.classifier[3].in_features
-    m.classifier[3] = nn.Linear(num_ftrs, 4)
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(f'Checkpoint missing: {MODEL_PATH}')
+    checkpoint = torch.load(MODEL_PATH,map_location='cpu',weights_only=True)
+    names = checkpoint['diseases']
+    if checkpoint.get('architecture') != 'mobilenet_v3_small' or names != list(DISPLAY):
+        raise ValueError('Unexpected architecture or disease order in checkpoint')
+    if checkpoint.get('output_activation') != 'sigmoid':
+        raise ValueError('Not a sigmoid multilabel checkpoint')
+    if set(checkpoint['class_to_idx']) != set(names+['healthy']):
+        raise ValueError('Expected five training categories including healthy')
+    net = models.mobilenet_v3_small(weights=None)
+    net.classifier[3] = nn.Linear(net.classifier[3].in_features,len(names))
+    net.load_state_dict(checkpoint['model_state_dict'],strict=True)
+    net.eval()
+    pre = transforms.Compose([transforms.Resize(tuple(checkpoint['image_size'])), transforms.ToTensor(),
+                              transforms.Normalize(checkpoint['mean'],checkpoint['std'])])
+    return net, names, pre, checkpoint
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+try:
+    model, diseases, preprocess, checkpoint = load_model()
+except Exception as exc:
+    st.error(f'Prediction disabled: {exc}')
+    st.stop()
 
-    # Search all possible directory structures where weights could exist
-    possible_paths = [
-        os.path.join(base_dir, "skin_model.pth"),
-        os.path.join(base_dir, "..", "skin_model.pth"),
-        os.path.join(base_dir, "skin_model"),
-        os.path.join(base_dir, "..", "skin_model"),
-        "skin_model.pth"
-    ]
+st.info('Fitzpatrick phototype and site are recorded for review only; they do not currently change the model predictions. Contrast enhancement is not validated vascular or melanin separation.')
+up = st.file_uploader('Upload a photograph (avoid identifiable patient information)',type=['jpg','jpeg','png'])
+cam = st.camera_input('Or take a photograph') if up is None else None
+file = up if up is not None else cam
+if file is None:
+    st.stop()
+raw = file.getvalue()
+if len(raw)>12*1024*1024:
+    st.error('Maximum image size is 12 MB.'); st.stop()
+try:
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert('RGB')
+except Exception:
+    st.error('Could not open the image.'); st.stop()
+if img.width * img.height > 25_000_000:
+    st.error('Image exceeds 25 megapixels.'); st.stop()
+# New image clears the prior assessment and model result.
+fingerprint=hashlib.sha256(raw).hexdigest()
+if st.session_state.get('active_image') != fingerprint:
+    st.session_state['active_image']=fingerprint
+    st.session_state['locked_assessment']=None
+    st.session_state['analysis']=None
 
-    loaded = False
-    for path in possible_paths:
-        if os.path.exists(path):
-            try:
-                m.load_state_dict(torch.load(path, map_location="cpu"))
-                loaded = True
-                break
-            except Exception:
-                pass
+st.image(img, caption='Input image',use_container_width=True)
+with st.form('clinician_before_ai'):
+    st.subheader('1. Independent clinician assessment')
+    doctor=st.selectbox('Evaluator code',['Doctor A','Doctor B','Doctor C'])
+    phototype=st.selectbox('Reported Fitzpatrick type (optional)', ['Unknown','Type I','Type II','Type III','Type IV','Type V','Type VI'])
+    site=st.selectbox('Anatomical site',['Unknown','Face / perioral','Limbs / extremities','Trunk','Flexural folds / groin','Other'])
+    assessment=st.selectbox('Assessment BEFORE viewing AI results',CLINICIAN_OPTIONS)
+    notes=st.text_area('Observations (do not enter personal identifiers)',max_chars=1000)
+    lock=st.form_submit_button('Lock assessment')
+if lock:
+    if st.session_state['locked_assessment'] is not None:
+        st.warning('An assessment is already locked for this image. To assess independently again, upload a new image in a new session.')
+    else:
+        st.session_state['locked_assessment']={
+            'timestamp_utc':datetime.now(timezone.utc).isoformat(),
+            'evaluator_code':doctor,'phototype':phototype,'site':site,
+            'assessment':assessment,'notes':notes}
+        st.success('Assessment locked for this image. You may now run AI analysis.')
+if st.session_state['locked_assessment'] is None:
+    st.info('Record the independent assessment first to limit anchoring bias.')
+    st.stop()
 
-    if not loaded:
-        st.warning("⚠️ Notice: Running on uninitialized base weights. Please ensure skin_model.pth is in your GitHub repository.")
+if st.button('2. Run AI analysis',disabled=st.session_state['analysis'] is not None):
+    with torch.inference_mode():
+        logits=model(preprocess(img).unsqueeze(0))
+        scores=torch.sigmoid(logits)[0].cpu().numpy().tolist()
+    a=cv2.cvtColor(np.asarray(img),cv2.COLOR_RGB2LAB)[:,:,1]
+    contrast=cv2.createCLAHE(clipLimit=3.0,tileGridSize=(8,8)).apply(a)
+    heat=cv2.cvtColor(cv2.applyColorMap(contrast,cv2.COLORMAP_MAGMA),cv2.COLOR_BGR2RGB)
+    st.session_state['analysis']={'scores':scores,'heatmap':heat}
 
-    m.eval()
-    return m
+analysis=st.session_state['analysis']
+if analysis is None:
+    st.stop()
+st.subheader('3. Experimental contrast map')
+st.image(analysis['heatmap'],caption='CLAHE-enhanced CIELAB a-channel; not a validated vascular measurement',use_container_width=True)
+st.subheader('4. Independent disease scores (NOT calibrated probabilities)')
+for name,score in zip(diseases,analysis['scores']):
+    st.write(f'**{DISPLAY[name]}:** {score*100:.1f} / 100 (experimental score)')
+    st.progress(float(score))
+st.warning('No decision threshold has been clinically validated. Low scores do NOT confirm healthy skin; high scores do NOT confirm disease. Unseen diseases may generate high scores.')
 
-model = load_model()
+st.subheader('5. Condition-related reference notes')
+st.caption('General points for trained clinicians to verify, NOT individual treatment suggestions. Not linked to a diagnostic decision.')
+for name in diseases:
+    with st.expander(DISPLAY[name]):
+        st.write(REFERENCE[name])
 
-# --- Image Preprocessing ---
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
-
-# --- Image Input ---
-image_input = st.file_uploader("Upload Lesion Photo", type=["jpg", "png", "jpeg"])
-if not image_input:
-    image_input = st.camera_input("Or take a picture with camera")
-
-if image_input:
-    img = Image.open(image_input).convert("RGB")
-    st.image(img, caption="Target Clinical Image", use_container_width=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fst = st.selectbox(
-            "Fitzpatrick Phototype",
-            ["Type III", "Type IV", "Type V", "Type VI"],
-            index=1
-        )
-    with col2:
-        lesion_loc = st.selectbox(
-            "Anatomical Site",
-            ["Face / Perioral", "Limbs / Extremities", "Trunk", "Flexural folds / Groin"]
-        )
-
-    if st.button("Run Multi-Class Triage & Visual Deconvolution"):
-        # 1. Melanin-Decoupled Vascular Contrast Isolation (CIELAB Space)
-        np_img = np.array(img)
-        lab = cv2.cvtColor(np_img, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced_a = clahe.apply(a)
-
-        # Apply Heatmap via OpenCV Magma colormap
-        heatmap = cv2.applyColorMap(enhanced_a, cv2.COLORMAP_MAGMA)
-        heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-
-        st.markdown("### 🔍 Vascular Contrast Isolation (Melanin-Decoupled)")
-        st.image(heatmap_rgb, caption="Sub-Visual Erythema & Border Contrast Map", use_container_width=True)
-
-        # 2. Multi-Class Probability Inference
-        input_tensor = transform(img).unsqueeze(0)
-        with torch.no_grad():
-            output = model(input_tensor)
-            probs = torch.softmax(output, dim=1)[0].numpy() * 100
-
-        top_idx = int(np.argmax(probs))
-        top_confidence = float(probs[top_idx])
-
-        # 3. Confidence Threshold Gate (Handling Out-of-Distribution / Clear Skin)
-        if top_confidence < 45.0:
-            st.info(
-                "ℹ️ **Indeterminate / Low Contrast Detected:** Visual features do not meet the minimum diagnostic threshold for active lesion differentiation. "
-                "Ensure the lesion is focused and centered, or consider in-person clinical dermoscopy."
-            )
-        else:
-            st.markdown("### 📊 Differential Confidence Breakdown")
-            for i, class_name in enumerate(CLASSES):
-                st.write(f"**{class_name}:** {probs[i]:.1f}%")
-                st.progress(int(probs[i]))
-
-            # 4. Clinical Safety Flags
-            if top_idx == 1:
-                st.error("⚠️ **Bacterial Pyoderma Suspected:** Contraindicated for isolated topical corticosteroid monotherapy.")
-            elif top_idx == 3:
-                st.warning("⚠️ **Superficial Fungal Suspected:** High risk of Tinea Incognito if topical steroids are applied without antifungal coverage.")
-            elif top_idx == 0:
-                st.info("ℹ️ **Inflammatory Pattern (Eczema):** Evaluate barrier disruption, pruritus history, and xerosis.")
-            elif top_idx == 2:
-                st.info("ℹ️️ **Hyperkeratotic Plaque Pattern (Psoriasis):** Examine extensor surfaces for bilateral symmetry.")
-
-            # 5. Clinical Management & Pharmacological Reference Pathways
-            st.markdown("---")
-            st.subheader("📋 Therapeutic Reference & Clinical Pathways")
-            with st.expander(f"View Standard-of-Care Considerations for {CLASSES[top_idx]}", expanded=True):
-                if top_idx == 0:  # Eczema
-                    st.markdown("""
-                    **First-Line Therapeutic Options (Physician Discretion):**
-                    * **Barrier Repair:** Liberal application of unscented, ceramide- or lipid-rich emollients immediately post-bathing.
-                    * **Anti-Inflammatory:** Topical corticosteroids (low-potency hydrocortisone 1–2.5% for facial/flexural areas; medium-potency for trunk/extremities) or topical calcineurin inhibitors (tacrolimus 0.03–0.1%).
-                    
-                    ⚠️ **Safety Precaution:** If meliceric (honey-colored) crusting or purulence develops, evaluate for secondary *Staphylococcus aureus* superinfection before escalating steroid potency.
-                    """)
-                elif top_idx == 1:  # Impetigo
-                    st.markdown("""
-                    **First-Line Therapeutic Options (Physician Discretion):**
-                    * **Topical Antibacterial (Localized):** Crust debridement using warm saline soaks; topical mupirocin 2% or fusidic acid ointment 2–3 times daily for 5–7 days.
-                    * **Systemic Antibacterial (Widespread / Bullous):** Oral beta-lactamase-resistant antibiotic regimen (cephalexin or amoxicillin-clavulanate).
-                    
-                    🛑 **CRITICAL CONTRAINDICATION:** **Avoid topical corticosteroid monotherapy.** Corticosteroids suppress local immune defenses, driving accelerated bacterial proliferation.
-                    """)
-                elif top_idx == 2:  # Psoriasis
-                    st.markdown("""
-                    **First-Line Therapeutic Options (Physician Discretion):**
-                    * **Topical Therapy:** Fixed-dose combination topical corticosteroid and vitamin D3 analogue (calcipotriene/betamethasone dipropionate).
-                    * **Keratolytic Agents:** Topical salicylic acid (2–5%) or urea formulations to facilitate scale debridement.
-                    
-                    ℹ️ **Clinical Note:** Avoid abrupt discontinuation of systemic corticosteroids to prevent precipitating generalized pustular psoriasis.
-                    """)
-                elif top_idx == 3:  # Tinea
-                    st.markdown("""
-                    **First-Line Therapeutic Options (Physician Discretion):**
-                    * **Topical Antifungals:** Topical allylamines (terbinafine 1%) or azoles (clotrimazole, ketoconazole) applied daily, extending at least 2 cm beyond the active annular border for 2–4 weeks.
-                    * **Extensive / Recalcitrant:** Oral terbinafine or itraconazole following potassium hydroxide (KOH) examination confirmation.
-                    
-                    🛑 **CRITICAL CONTRAINDICATION:** **Avoid topical corticosteroid monotherapy.** Steroids artificially blunt erythema while allowing rapid mycelial proliferation (*Tinea Incognito*).
-                    """)
-                st.caption("⚖️ *Investigational pilot decision-support reference only. Not a prescription or substitute for independent clinical judgment.*")
-
-        # 6. Dermatologist Concordance Entry & Field Data Logging
-        st.markdown("---")
-        st.subheader("👨‍⚕️ Clinician Concordance Entry")
-        doc_name = st.selectbox("Evaluating Clinician", ["Doctor A", "Doctor B", "Doctor C"])
-        doc_diag = st.radio(
-            "Your Independent Clinical Assessment:",
-            CLASSES + ["Indeterminate / Laboratory Biopsy Needed"]
-        )
-        notes = st.text_input("Clinical Observations")
-
-        if st.button("Log Case in Validation Dataset"):
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            log_file = os.path.join(base_dir, "clinical_validation_log.csv")
-            log_entry = {
-                "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Doctor": doc_name,
-                "Phototype": fst,
-                "Site": lesion_loc,
-                "Top_Model_Prediction": CLASSES[top_idx],
-                "Confidence": f"{probs[top_idx]:.1f}%",
-                "Doctor_Assessment": doc_diag,
-                "Concordance": "Yes" if CLASSES[top_idx] == doc_diag else "No",
-                "Notes": notes
-            }
-            df = pd.DataFrame([log_entry])
-            if not os.path.exists(log_file):
-                df.to_csv(log_file, index=False)
-            else:
-                df.to_csv(log_file, mode='a', header=False, index=False)
-            st.success("Case successfully logged to clinical_validation_log.csv!")
+st.subheader('6. Clinician feedback (research export)')
+review=st.text_area('Post-AI observations / disagreement (no identifying information)',key='post_ai_notes')
+feedback={
+ 'model_version':'skin_model_multilabel.pth',
+ 'model_validated_for_clinical_use':False,
+ 'independent_assessment':st.session_state['locked_assessment'],
+ 'uncalibrated_scores':dict(zip(diseases,[round(float(x),6) for x in analysis['scores']])),
+ 'post_ai_notes':review,
+ 'reference_standard':'Not established by this entry',
+}
+st.download_button('Download this research feedback as JSON',data=json.dumps(feedback,indent=2),
+                   file_name='impetus_feedback.json',mime='application/json')
+st.caption('This version does not persist photographs or feedback into a server-side clinical database. Downloads are local to the clinician. Do not use identifiable patient information. A production clinical workflow requires approved secure storage, authentication, and governance.')
