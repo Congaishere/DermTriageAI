@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torchvision import models, transforms
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / 'skin_model_multilabel.pth'
 DISPLAY = {'eczema':'Eczema (atopic/allergic)', 'impetigo':'Impetigo / pyoderma',
            'psoriasis':'Psoriasis (plaque/scaly)', 'tinea':'Tinea (fungal)'}
