@@ -1,7 +1,7 @@
+streamlit
 torch
 torchvision
-streamlit
-pillow
 numpy
-pandas
+Pillow
 opencv-python-headless
+scikit-learn
